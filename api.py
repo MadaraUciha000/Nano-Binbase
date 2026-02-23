@@ -1,327 +1,333 @@
-from flask import Flask, request, session, jsonify, render_template_string, redirect, url_for, abort
+from flask import Flask, request, session, jsonify, render_template_string
 from urllib.parse import urlparse
-from datetime import datetime
-import json
+import sqlite3
 import os
 from functools import wraps
 
 app = Flask(__name__)
-app.secret_key = "nano_vault_secure_8822_alpha" # In production, use os.urandom(24)
+app.secret_key = "nano_core_ultra_2026"
 
-# Security Headers & Config
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE='Lax',
-    PERMANENT_SESSION_LIFETIME=1800 # 30 Minute timeout
-)
+DB_FILE = "nano.db"
 
-DATA_FILE = "sites.json"
-STATS_FILE = "stats.json"
+# =========================
+# DB SETUP
+# =========================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS sites (id INTEGER PRIMARY KEY AUTOINCREMENT, site TEXT, bin TEXT)")
+    conn.commit()
+    conn.close()
 
-# Initialize Data
-for file, default in [(DATA_FILE, {}), (STATS_FILE, [])]:
-    if not os.path.exists(file):
-        with open(file, "w") as f:
-            json.dump(default, f)
+init_db()
 
-# ------------------------
-# SECURITY MIDDLEWARE
-# ------------------------
+def db_op(query, args=(), fetch=False):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(query, args)
+    res = c.fetchall() if fetch else None
+    conn.commit()
+    conn.close()
+    return res
+
+# =========================
+# HELPERS
+# =========================
 def login_required(f):
     @wraps(f)
-    def decorated_function(*args, **kwargs):
+    def decorated(*args, **kwargs):
         if not session.get("logged"):
-            # Redirect to login if accessing UI, else return 403 for API
-            if request.path == "/dashboard":
-                return redirect(url_for('login_page'))
-            return jsonify({"error": "Unauthorized Access"}), 403
+            return jsonify({"success": False, "msg": "Unauthorized"}), 403
         return f(*args, **kwargs)
-    return decorated_function
+    return decorated
 
-# ------------------------
-# CORE LOGIC
-# ------------------------
 def normalize(site):
     site = site.strip().lower()
     if not site.startswith("http"): site = "http://" + site
-    return urlparse(site).netloc.replace("www.", "")
+    parsed = urlparse(site).netloc
+    return parsed.replace("www.", "") if parsed else site.replace("www.", "")
 
-def load_db(file):
-    with open(file, "r") as f: return json.load(f)
-
-def save_db(file, data):
-    with open(file, "w") as f: json.dump(data, f, indent=4)
-
-def log_event():
-    stats = load_db(STATS_FILE)
-    stats.append(datetime.now().strftime("%Y-%m-%d"))
-    save_db(STATS_FILE, stats[-5000:]) # Keep last 5k requests
-
-# ------------------------
-# API ENDPOINTS
-# ------------------------
-
-@app.route("/Nano")
-@login_required
-def nano():
-    site_query = request.args.get("search")
-    if not site_query: return jsonify({"status": "error", "msg": "Empty query"})
-    
-    log_event()
-    site = normalize(site_query)
-    db = load_db(DATA_FILE)
-    
-    if site in db:
-        return jsonify({"status": "Found", "site": site, "bins": db[site]})
-    return jsonify({"status": "Not Found"})
+# =========================
+# ADMIN API ROUTES
+# =========================
 
 @app.route("/api/admin/login", methods=["POST"])
-def api_login():
+def login():
     data = request.json
-    # High security: Clear existing session first
-    session.clear()
-    if data.get("username") == "Admin" and data.get("password") == "Admin@000":
-        session.permanent = True
+    if data.get("key") == "admin@000":
         session["logged"] = True
         return jsonify({"success": True})
     return jsonify({"success": False}), 401
 
-@app.route("/api/admin/logout")
-def logout():
-    session.clear()
-    return redirect(url_for('login_page'))
+@app.route("/api/admin/list")
+@login_required
+def list_sites():
+    rows = db_op("SELECT site, bin FROM sites ORDER BY id DESC", fetch=True)
+    return jsonify([{"site": r["site"], "bin": r["bin"]} for r in rows])
 
 @app.route("/api/admin/add", methods=["POST"])
 @login_required
 def add():
     data = request.json
-    site, bin_no = normalize(data["site"]), data["bin"]
-    db = load_db(DATA_FILE)
-    if site not in db: db[site] = []
-    if bin_no not in db[site]: db[site].append(bin_no)
-    save_db(DATA_FILE, db)
+    site = normalize(data["site"])
+    bin_val = data["bin"]
+    if isinstance(bin_val, list): bin_val = bin_val[0] if bin_val else ""
+    db_op("INSERT INTO sites (site, bin) VALUES (?,?)", (site, str(bin_val)))
     return jsonify({"success": True})
 
 @app.route("/api/admin/remove", methods=["POST"])
 @login_required
 def remove():
-    site = normalize(request.json["site"])
-    db = load_db(DATA_FILE)
-    if site in db:
-        del db[site]
-        save_db(DATA_FILE, db)
-        return jsonify({"success": True})
-    return jsonify({"success": False})
+    data = request.json
+    db_op("DELETE FROM sites WHERE site=? AND bin=?", (normalize(data["site"]), data["bin"]))
+    return jsonify({"success": True})
 
-@app.route("/api/admin/stats")
+@app.route("/api/admin/clear_all", methods=["POST"])
 @login_required
-def stats():
-    db = load_db(DATA_FILE)
-    logs = load_db(STATS_FILE)
-    today = datetime.now().strftime("%Y-%m-%d")
-    return jsonify({
-        "count": len(db),
-        "reqs": logs.count(today),
-        "db_size": f"{os.path.getsize(DATA_FILE)/1024:.1f}KB"
-    })
+def clear_all():
+    db_op("DELETE FROM sites")
+    return jsonify({"success": True})
 
-# ------------------------
-# VIEWS (HTML)
-# ------------------------
+# =========================
+# PUBLIC SEARCH API
+# =========================
+
+@app.route("/nano")
+def public_search():
+    q = request.args.get("search")
+    if not q: return jsonify({"status": "error", "msg": "Missing query"}), 400
+    site = normalize(q)
+    rows = db_op("SELECT bin FROM sites WHERE site=?", (site,), fetch=True)
+    if rows:
+        return jsonify({
+            "status": "Found", 
+            "site": site, 
+            "bins": list(set([r["bin"] for r in rows]))
+        })
+    return jsonify({"status": "Not Found", "queried": site}), 404
+
+# =========================
+# UI TEMPLATE
+# =========================
 
 @app.route("/")
-def login_page():
-    if session.get("logged"): return redirect(url_for('dashboard'))
-    return render_template_string("""
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+HTML_TEMPLATE = r'''
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>NanoLogin | Secure Gate</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nano Core | SaaS</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
-        body { background: radial-gradient(circle at top left, #0f172a, #1e293b); height: 100vh; display: flex; align-items: center; justify-content: center; font-family: 'Inter', sans-serif; color: white; }
-        .glass-box { background: rgba(255, 255, 255, 0.03); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); }
+        body { font-family: 'Plus Jakarta Sans', sans-serif; background: #050505; color: #fff; }
+        .glass { background: rgba(15, 15, 15, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.08); }
+        .toast-glass { background: rgba(20, 20, 20, 0.9); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); }
+        .input-saas { background: #0a0a0a; border: 1px solid #1a1a1a; transition: 0.2s; color: #fff; }
+        .input-saas:focus { border-color: #3b82f6; outline: none; }
+        #app-interface { display: none; }
+        .row-hidden { display: none !important; }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        .animate-toast { animation: slideIn 0.3s ease-out forwards; }
     </style>
 </head>
-<body>
-    <div class="glass-box p-10 rounded-3xl w-full max-w-md border-t border-white/20">
-        <div class="text-center mb-8">
-            <div class="inline-flex p-4 bg-blue-600/20 rounded-2xl mb-4"><i data-lucide="fingerprint" class="w-10 h-10 text-blue-400"></i></div>
-            <h1 class="text-3xl font-bold tracking-tight">Access Control</h1>
-            <p class="text-slate-400 mt-2">Enter credentials to unlock dashboard</p>
-        </div>
-        <div class="space-y-4">
-            <div>
-                <label class="text-xs font-semibold text-slate-500 uppercase ml-1">Identity</label>
-                <input type="text" id="u" class="w-full bg-slate-900/50 border border-slate-700 p-4 rounded-xl mt-1 outline-none focus:border-blue-500 transition-all" placeholder="Username">
+<body class="min-h-screen">
+
+    <div id="toast-container" class="fixed top-6 right-6 z-[100] space-y-3 pointer-events-none"></div>
+
+    <div id="login-screen" class="min-h-screen flex items-center justify-center p-6">
+        <div class="w-full max-w-[400px] p-10 glass rounded-[2.5rem] shadow-2xl text-center">
+            <div class="inline-flex p-4 bg-white/5 border border-white/10 rounded-2xl mb-6">
+                <i data-lucide="shield-check" class="text-blue-500 w-8 h-8"></i>
             </div>
-            <div>
-                <label class="text-xs font-semibold text-slate-500 uppercase ml-1">Keyphrase</label>
-                <input type="password" id="p" class="w-full bg-slate-900/50 border border-slate-700 p-4 rounded-xl mt-1 outline-none focus:border-blue-500 transition-all" placeholder="••••••••">
-            </div>
-            <button onclick="doLogin()" class="w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-xl font-bold text-lg mt-4 shadow-lg shadow-blue-900/20 transition-all active:scale-95">Verify Identity</button>
+            <h1 class="text-2xl font-bold mb-10">Nano Core Login</h1>
+            <input type="password" id="auth-key" placeholder="Access Key" class="w-full input-saas p-4 rounded-2xl text-center mb-4">
+            <button onclick="attemptLogin()" class="w-full bg-white text-black font-bold py-4 rounded-2xl text-xs uppercase tracking-widest">Initialize</button>
         </div>
     </div>
-    <script>
-        lucide.createIcons();
-        function doLogin(){
-            fetch("/api/admin/login", {
-                method:"POST",
-                headers:{"Content-Type":"application/json"},
-                body:JSON.stringify({username:document.getElementById("u").value, password:document.getElementById("p").value})
-            }).then(r=> r.ok ? window.location.href="/dashboard" : alert("Access Denied"));
-        }
-    </script>
-</body>
-</html>
-""")
 
-@app.route("/dashboard")
-@login_required
-def dashboard():
-    return render_template_string("""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Nano | System Admin</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <style>
-        body { background: #020617; color: #f8fafc; font-family: 'Inter', sans-serif; }
-        .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 1.5rem; transition: all 0.3s; }
-        .card:hover { border-color: #3b82f6; transform: translateY(-2px); }
-        .input-dark { background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; padding: 0.75rem; width: 100%; outline: none; }
-        .input-dark:focus { border-color: #3b82f6; }
-    </style>
-</head>
-<body class="flex">
-
-    <aside class="w-72 h-screen border-r border-slate-800 p-8 flex flex-col fixed">
-        <div class="flex items-center gap-3 mb-12">
-            <div class="w-10 h-10 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-blue-500/20">
-                <i data-lucide="zap" class="text-white w-6 h-6"></i>
+    <div id="app-interface" class="min-h-screen flex flex-col">
+        <nav class="h-16 border-b border-white/5 px-8 flex items-center justify-between sticky top-0 bg-[#050505]/90 backdrop-blur-xl z-30">
+            <div class="flex items-center gap-2"><i data-lucide="zap" class="text-blue-500"></i><span class="font-bold">NANO CORE</span></div>
+            <div class="flex gap-4">
+                <button onclick="nuclearClear()" class="text-xs text-orange-400 font-semibold px-3 py-1 rounded-lg border border-orange-400/20">WIPE ALL</button>
+                <button onclick="location.reload()" class="text-xs text-red-500 font-bold px-3 py-1">EXIT</button>
             </div>
-            <span class="text-xl font-bold tracking-tight">NANO<span class="text-blue-500">GLAZE</span></span>
-        </div>
-        
-        <nav class="space-y-2 flex-1">
-            <div class="text-xs font-bold text-slate-500 uppercase tracking-widest mb-4">Core Management</div>
-            <button class="w-full flex items-center gap-3 p-4 bg-blue-600/10 text-blue-400 rounded-2xl border border-blue-500/20">
-                <i data-lucide="layout-grid" class="w-5 h-5"></i> Dashboard
-            </button>
-            <a href="/api/admin/logout" class="w-full flex items-center gap-3 p-4 text-slate-400 hover:bg-slate-800 rounded-2xl transition-all">
-                <i data-lucide="log-out" class="w-5 h-5"></i> Terminate Session
-            </a>
         </nav>
-        
-        <div class="p-4 bg-slate-900/50 rounded-2xl border border-slate-800">
-            <p class="text-xs text-slate-500 mb-1">Status</p>
-            <div class="flex items-center gap-2">
-                <div class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                <span class="text-sm font-semibold">System Encrypted</span>
-            </div>
+
+        <div class="flex flex-col lg:flex-row flex-1">
+            <aside class="w-full lg:w-80 border-r border-white/5 p-8 space-y-8 bg-[#080808]">
+                <div>
+                    <label class="text-[10px] font-bold text-slate-500 uppercase mb-3 block">Live Search</label>
+                    <input id="search-input" oninput="filterTable()" placeholder="Start typing..." class="w-full input-saas p-3 rounded-xl text-xs">
+                </div>
+                <div>
+                    <label class="text-[10px] font-bold text-slate-500 uppercase mb-3 block">Add Entry</label>
+                    <div class="space-y-3">
+                        <input id="as" placeholder="Domain" class="w-full input-saas p-3.5 rounded-xl text-xs">
+                        <input id="ab" placeholder="BIN ID" class="w-full input-saas p-3.5 rounded-xl text-xs font-mono">
+                        <button onclick="addSite()" class="w-full bg-blue-600 font-bold py-3.5 rounded-xl text-[11px]">COMMIT</button>
+                    </div>
+                </div>
+                <div class="pt-8 border-t border-white/5 grid grid-cols-2 gap-2">
+                    <button onclick="exportData()" class="bg-white/5 border border-white/10 py-3 rounded-xl text-[10px]">EXPORT</button>
+                    <button onclick="document.getElementById('importFile').click()" class="bg-white/5 border border-white/10 py-3 rounded-xl text-[10px]">IMPORT</button>
+                    <input type="file" id="importFile" class="hidden" onchange="importData(event)">
+                </div>
+            </aside>
+
+            <main class="flex-1 p-6 lg:p-12 overflow-y-auto">
+                <div class="max-w-4xl mx-auto">
+                    <div class="flex justify-between items-end mb-8">
+                        <h2 class="text-2xl font-bold">Active Registry</h2>
+                        <span id="record-count" class="text-[10px] font-bold text-blue-500 tracking-widest bg-blue-500/10 px-3 py-1 rounded-full">0 RECORDS</span>
+                    </div>
+                    <div class="glass rounded-3xl overflow-hidden shadow-2xl">
+                        <table class="w-full text-left">
+                            <thead class="bg-white/5 text-[10px] text-slate-500 uppercase font-bold"><th class="px-8 py-4">Endpoint</th><th class="px-8 py-4">BIN ID</th><th class="px-8 py-4 text-right">Action</th></thead>
+                            <tbody id="db-body" class="text-xs divide-y divide-white/5"></tbody>
+                        </table>
+                        <div id="empty-state" class="py-20 text-center text-slate-600">No matching records.</div>
+                    </div>
+                </div>
+            </main>
         </div>
-    </aside>
-
-    <main class="ml-72 flex-1 p-12">
-        <header class="flex justify-between items-start mb-12">
-            <div>
-                <h1 class="text-4xl font-extrabold tracking-tight">Control Center</h1>
-                <p class="text-slate-400 mt-2">Manage your secure database entries</p>
-            </div>
-            <div class="text-right">
-                <div id="clock" class="text-xl font-mono font-bold text-blue-500">00:00:00</div>
-                <div class="text-slate-500 text-sm">Session Active</div>
-            </div>
-        </header>
-
-        <div class="grid grid-cols-3 gap-6 mb-12">
-            <div class="card p-8">
-                <p class="text-slate-500 font-medium">Total Indexed Sites</p>
-                <h2 id="st-count" class="text-4xl font-black mt-2">0</h2>
-            </div>
-            <div class="card p-8 border-l-4 border-l-blue-500">
-                <p class="text-slate-500 font-medium">Requests Today</p>
-                <h2 id="st-reqs" class="text-4xl font-black mt-2 text-blue-400">0</h2>
-            </div>
-            <div class="card p-8">
-                <p class="text-slate-500 font-medium">Database Footprint</p>
-                <h2 id="st-size" class="text-4xl font-black mt-2 text-indigo-400">0.0KB</h2>
-            </div>
-        </div>
-
-        <div class="grid grid-cols-2 gap-8">
-            <section class="card p-8">
-                <h3 class="text-xl font-bold mb-6 flex items-center gap-2">
-                    <i data-lucide="search" class="w-5 h-5 text-blue-400"></i> Query Database
-                </h3>
-                <div class="flex gap-2">
-                    <input type="text" id="sq" class="input-dark" placeholder="Domain name...">
-                    <button onclick="search()" class="bg-blue-600 px-6 rounded-xl font-bold hover:bg-blue-500 transition-all">Search</button>
-                </div>
-                <div id="res" class="mt-4 p-4 bg-slate-950 rounded-xl min-h-[80px] text-sm font-mono text-blue-300 overflow-auto border border-slate-800">
-                    // Output awaiting query...
-                </div>
-            </section>
-
-            <section class="card p-8">
-                <h3 class="text-xl font-bold mb-6 flex items-center gap-2">
-                    <i data-lucide="plus-circle" class="w-5 h-5 text-green-400"></i> Insert Entry
-                </h3>
-                <div class="space-y-4">
-                    <input type="text" id="as" class="input-dark" placeholder="Site (domain.com)">
-                    <input type="text" id="ab" class="input-dark" placeholder="Bin Number">
-                    <button onclick="addSite()" class="w-full bg-green-600 py-3 rounded-xl font-bold hover:bg-green-500 transition-all">Execute Insertion</button>
-                </div>
-            </section>
-
-            <section class="card p-8 col-span-2">
-                <h3 class="text-xl font-bold mb-6 flex items-center gap-2 text-red-400">
-                    <i data-lucide="trash-2" class="w-5 h-5"></i> Purge Records
-                </h3>
-                <div class="flex gap-4">
-                    <input type="text" id="rs" class="input-dark flex-1" placeholder="Target domain to delete...">
-                    <button onclick="removeSite()" class="bg-red-600/20 text-red-400 border border-red-500/30 px-10 rounded-xl font-bold hover:bg-red-600 hover:text-white transition-all">Confirm Deletion</button>
-                </div>
-            </section>
-        </div>
-    </main>
+    </div>
 
     <script>
         lucide.createIcons();
-        function refresh() {
-            fetch("/api/admin/stats").then(r=>r.json()).then(d=>{
-                document.getElementById('st-count').innerText = d.count;
-                document.getElementById('st-reqs').innerText = d.reqs;
-                document.getElementById('st-size').innerText = d.db_size;
+
+        function toast(msg, type='success') {
+            const container = document.getElementById('toast-container');
+            const div = document.createElement('div');
+            div.className = 'toast-glass p-4 rounded-2xl flex items-center gap-3 min-w-[250px] animate-toast pointer-events-auto';
+            div.innerHTML = `<i data-lucide="${type==='success'?'check-circle':'alert-circle'}" class="w-4 h-4 ${type==='success'?'text-green-400':'text-red-400'}"></i><span class="text-xs font-semibold">${msg}</span>`;
+            container.appendChild(div);
+            lucide.createIcons();
+            setTimeout(() => div.remove(), 3000);
+        }
+
+        async function attemptLogin() {
+            const res = await fetch('/api/admin/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({key: document.getElementById('auth-key').value})
             });
+            if(res.ok) {
+                document.getElementById('login-screen').style.display = 'none';
+                document.getElementById('app-interface').style.display = 'flex';
+                toast('Auth Success');
+                loadData();
+            } else toast('Invalid Key', 'error');
         }
-        function search() {
-            fetch("/Nano?search="+document.getElementById('sq').value).then(r=>r.json()).then(d=>{
-                document.getElementById('res').innerHTML = `<pre>${JSON.stringify(d, null, 2)}</pre>`;
-                refresh();
+
+        async function loadData() {
+            const res = await fetch('/api/admin/list');
+            const data = await res.json();
+            const tbody = document.getElementById('db-body');
+            tbody.innerHTML = "";
+            data.forEach(item => renderRow(item.site, item.bin));
+            updateCount();
+        }
+
+        async function addSite() {
+            const site = document.getElementById('as').value;
+            const bin = document.getElementById('ab').value;
+            if(!site || !bin) return toast('Fill all fields', 'error');
+            const res = await fetch('/api/admin/add', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({site, bin})
             });
+            if(res.ok) {
+                renderRow(site, bin);
+                document.getElementById('as').value = '';
+                document.getElementById('ab').value = '';
+                toast('Record Added');
+                updateCount();
+            }
         }
-        function addSite() {
-            fetch("/api/admin/add", {
-                method:"POST", headers:{"Content-Type":"application/json"},
-                body: JSON.stringify({site: document.getElementById('as').value, bin: document.getElementById('ab').value})
-            }).then(() => { alert("Record Added"); refresh(); });
+
+        function renderRow(site, bin) {
+            const row = document.createElement('tr');
+            row.className = "hover:bg-white/[0.02] transition-colors";
+            row.innerHTML = `<td class="px-8 py-5 text-white font-medium">${site}</td><td class="px-8 py-5 text-slate-400 font-mono">${bin}</td><td class="px-8 py-5 text-right"><button onclick="removeRow(this, '${site}', '${bin}')" class="text-slate-600 hover:text-red-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button></td>`;
+            document.getElementById('db-body').prepend(row);
+            lucide.createIcons();
         }
-        function removeSite() {
-            if(!confirm("Purge this record?")) return;
-            fetch("/api/admin/remove", {
-                method:"POST", headers:{"Content-Type":"application/json"},
-                body: JSON.stringify({site: document.getElementById('rs').value})
-            }).then(() => { alert("Record Deleted"); refresh(); });
+
+        async function removeRow(btn, site, bin) {
+            if(!confirm("Delete?")) return;
+            const res = await fetch('/api/admin/remove', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({site, bin})
+            });
+            if(res.ok) { btn.closest('tr').remove(); updateCount(); toast('Deleted', 'error'); }
         }
-        setInterval(() => { document.getElementById('clock').innerText = new Date().toLocaleTimeString(); }, 1000);
-        refresh();
+
+        async function nuclearClear() {
+            if(!confirm("WIPE EVERYTHING?")) return;
+            const res = await fetch('/api/admin/clear_all', { method: 'POST' });
+            if(res.ok) { document.getElementById('db-body').innerHTML = ""; updateCount(); toast('Database Purged', 'error'); }
+        }
+
+        function filterTable() {
+            const q = document.getElementById('search-input').value.toLowerCase();
+            const rows = document.querySelectorAll('#db-body tr');
+            let match = 0;
+            rows.forEach(r => {
+                const visible = r.innerText.toLowerCase().includes(q);
+                r.classList.toggle('row-hidden', !visible);
+                if(visible) match++;
+            });
+            document.getElementById('empty-state').classList.toggle('hidden', match > 0);
+            document.getElementById('record-count').innerText = match + " MATCHES";
+        }
+
+        function updateCount() {
+            const count = document.querySelectorAll('#db-body tr').length;
+            document.getElementById('record-count').innerText = count + " RECORDS";
+            document.getElementById('empty-state').classList.toggle('hidden', count > 0);
+        }
+
+        function exportData() {
+            const data = Array.from(document.querySelectorAll('#db-body tr')).map(r => ({
+                site: r.cells[0].innerText, bin: r.cells[1].innerText
+            }));
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'}));
+            a.download = 'nano_export.json';
+            a.click();
+            toast('Export Ready');
+        }
+
+        function importData(e) {
+            const reader = new FileReader();
+            reader.onload = async (event) => {
+                const data = JSON.parse(event.target.result);
+                for(const item of data) {
+                    await fetch('/api/admin/add', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(item)
+                    });
+                }
+                loadData();
+                toast('Import Done');
+            };
+            reader.readAsText(e.target.files[0]);
+        }
     </script>
 </body>
 </html>
-""")
+'''
 
 if __name__ == "__main__":
-    app.run(debug=True, port=8080)
+    app.run(debug=True, port=5000)
