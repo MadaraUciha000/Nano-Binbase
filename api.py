@@ -10,7 +10,6 @@ app.secret_key = "nano_core_ultra_2026_secure"
 # =========================
 # SUPABASE CONFIG
 # =========================
-# In Vercel, it is better to use os.environ.get("SUPABASE_URL")
 SUPABASE_URL = "https://yfxyhzswspmnnvwuzrbz.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlmeHloenN3c3Btbm52d3V6cmJ6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE4NzAwMTUsImV4cCI6MjA4NzQ0NjAxNX0.6SLZtRie02fRMtdvrMVGv-zi6P4tmbJ89GykuoZ9D3M"
 
@@ -32,7 +31,6 @@ def normalize(site):
     site = site.strip().lower()
     if not site.startswith("http"): site = "http://" + site
     parsed = urlparse(site).netloc
-    # Handles cases like 'ultahost' (no TLD) or 'google.com'
     return parsed.replace("www.", "") if parsed else site.replace("http://", "").replace("www.", "")
 
 # =========================
@@ -59,8 +57,6 @@ def add():
     data = request.json
     site = normalize(data.get("site", ""))
     bin_val = data.get("bin", "")
-    
-    # Critical Fix: Convert single string/int to list to handle iteration
     bins_to_add = bin_val if isinstance(bin_val, list) else [bin_val]
     
     try:
@@ -82,7 +78,6 @@ def remove():
 @app.route("/api/admin/clear_all", methods=["POST"])
 @login_required
 def clear_all():
-    # Postgres delete requires a filter
     supabase.table("sites").delete().neq("id", -1).execute()
     return jsonify({"success": True})
 
@@ -95,7 +90,6 @@ def public_search():
     q = request.args.get("search")
     if not q: return jsonify({"status": "error", "msg": "No query"}), 400
     site = normalize(q)
-    
     response = supabase.table("sites").select("bin").eq("site", site).execute()
     
     if response.data:
@@ -131,198 +125,164 @@ HTML_TEMPLATE = r'''
         .input-saas { background: #0a0a0a; border: 1px solid #1a1a1a; transition: 0.2s; color: #fff; }
         .input-saas:focus { border-color: #3b82f6; outline: none; }
         #app-interface { display: none; }
-        .row-hidden { display: none !important; }
+        
+        /* Loading Screen Styles */
+        .loader-overlay { 
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%; 
+            background: rgba(0,0,0,0.85); backdrop-filter: blur(8px);
+            z-index: 9999; display: none; flex-direction: column;
+            align-items: center; justify-content: center;
+        }
+        .spinner {
+            width: 40px; height: 40px; border: 3px solid rgba(59, 130, 246, 0.2);
+            border-top: 3px solid #3b82f6; border-radius: 50%;
+            animation: spin 1s linear infinite; margin-bottom: 1rem;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
         .animate-toast { animation: slideIn 0.3s ease-out forwards; }
     </style>
 </head>
 <body class="min-h-screen">
-    <div id="toast-container" class="fixed top-6 right-6 z-[100] space-y-3 pointer-events-none"></div>
+    <div id="import-loader" class="loader-overlay">
+        <div class="spinner"></div>
+        <p class="text-white font-bold text-lg">Importing Cloud Data</p>
+        <p id="import-status" class="text-blue-400 text-sm mt-2">Initializing...</p>
+    </div>
 
-    <div id="login-screen" class="min-h-screen flex items-center justify-center p-6">
-        <div class="w-full max-w-[400px] p-10 glass rounded-[2.5rem] text-center shadow-2xl">
-            <div class="inline-flex p-4 bg-blue-600/10 border border-blue-500/20 rounded-2xl mb-6">
-                <i data-lucide="shield-check" class="text-blue-500 w-8 h-8"></i>
-            </div>
-            <h1 class="text-2xl font-bold mb-10 tracking-tight">Nano Core</h1>
-            <input type="password" id="auth-key" placeholder="Access Key" class="w-full input-saas p-4 rounded-2xl text-center mb-4">
-            <button onclick="attemptLogin()" class="w-full bg-white text-black font-bold py-4 rounded-2xl text-xs uppercase tracking-widest hover:bg-slate-200 transition-all">Initialize Session</button>
+    <div id="toast-container" class="fixed top-4 right-4 z-50 flex flex-col gap-2"></div>
+
+    <div id="login-screen" class="min-h-screen flex items-center justify-center p-4">
+        <div class="glass p-8 rounded-2xl w-full max-w-md">
+            <h1 class="text-2xl font-bold mb-6 text-center">Nano Core Admin</h1>
+            <input type="password" id="admin-key" placeholder="Access Key" class="input-saas w-full p-3 rounded-xl mb-4 text-center">
+            <button onclick="handleLogin()" class="w-full bg-blue-600 hover:bg-blue-700 py-3 rounded-xl font-bold transition">Unlock Dashboard</button>
         </div>
     </div>
 
-    <div id="app-interface" class="min-h-screen flex flex-col">
-        <nav class="h-16 border-b border-white/5 px-8 flex items-center justify-between sticky top-0 bg-[#050505]/90 backdrop-blur-xl z-30">
-            <div class="flex items-center gap-2"><i data-lucide="zap" class="text-blue-500 w-5 h-5"></i><span class="font-bold tracking-tight">NANO CORE</span></div>
-            <div class="flex gap-6 items-center">
-                <button onclick="nuclearClear()" class="text-[10px] font-bold text-orange-400 hover:text-orange-300 transition-colors uppercase tracking-widest">Purge Cloud</button>
-                <div class="h-4 w-[1px] bg-white/10"></div>
-                <button onclick="location.reload()" class="text-[10px] font-bold text-red-500 uppercase tracking-widest">Logout</button>
+    <div id="app-interface" class="p-4 lg:p-8 max-w-7xl mx-auto">
+        <header class="flex flex-col md:flex-row justify-between items-center gap-4 mb-8">
+            <div>
+                <h1 class="text-3xl font-bold">Cloud Registry</h1>
+                <p class="text-gray-400">Manage site-to-bin mappings</p>
             </div>
-        </nav>
+            <div class="flex gap-2">
+                <input type="file" id="import-file" class="hidden" accept=".json" onchange="importData(event)">
+                <button onclick="document.getElementById('import-file').click()" class="bg-gray-800 hover:bg-gray-700 px-4 py-2 rounded-lg flex items-center gap-2 transition">
+                    <i data-lucide="upload" class="w-4 h-4"></i> Import
+                </button>
+                <button onclick="exportData()" class="bg-gray-800 hover:bg-gray-700 px-4 py-2 rounded-lg flex items-center gap-2 transition">
+                    <i data-lucide="download" class="w-4 h-4"></i> Export
+                </button>
+            </div>
+        </header>
 
-        <div class="flex flex-col lg:flex-row flex-1 overflow-hidden">
-            <aside class="w-full lg:w-80 border-r border-white/5 p-8 space-y-8 bg-[#080808] overflow-y-auto">
-                <div>
-                    <label class="text-[10px] font-bold text-slate-500 uppercase mb-3 block tracking-widest">Live Search</label>
-                    <div class="relative">
-                        <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-600"></i>
-                        <input id="search-input" oninput="filterTable()" placeholder="Search site or bin..." class="w-full input-saas pl-10 p-3 rounded-xl text-xs">
-                    </div>
-                </div>
-                <div>
-                    <label class="text-[10px] font-bold text-slate-500 uppercase mb-3 block tracking-widest">Registry Control</label>
-                    <div class="space-y-3">
-                        <input id="as" placeholder="Domain / Site" class="w-full input-saas p-3.5 rounded-xl text-xs">
-                        <input id="ab" placeholder="BIN (ID)" class="w-full input-saas p-3.5 rounded-xl text-xs font-mono">
-                        <button onclick="addSite()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3.5 rounded-xl text-[11px] shadow-lg shadow-blue-600/20 transition-all">COMMIT RECORD</button>
-                    </div>
-                </div>
-                <div class="pt-8 border-t border-white/5 grid grid-cols-2 gap-3">
-                    <button onclick="exportData()" class="bg-white/5 border border-white/10 py-3 rounded-xl text-[10px] flex items-center justify-center gap-2 hover:bg-white/10 transition-all"><i data-lucide="download" class="w-3 h-3"></i> EXPORT</button>
-                    <button onclick="document.getElementById('importFile').click()" class="bg-white/5 border border-white/10 py-3 rounded-xl text-[10px] flex items-center justify-center gap-2 hover:bg-white/10 transition-all"><i data-lucide="upload" class="w-3 h-3"></i> IMPORT</button>
-                    <input type="file" id="importFile" class="hidden" onchange="importData(event)">
-                </div>
-            </aside>
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div class="glass p-6 rounded-2xl h-fit">
+                <h2 class="text-xl font-bold mb-4">Add Entry</h2>
+                <input type="text" id="site-in" placeholder="website.com" class="input-saas w-full p-3 rounded-xl mb-3">
+                <input type="text" id="bin-in" placeholder="Bin (comma separated)" class="input-saas w-full p-3 rounded-xl mb-4">
+                <button onclick="addEntry()" class="w-full bg-blue-600 hover:bg-blue-700 py-3 rounded-xl font-bold transition">Add to Cloud</button>
+            </div>
 
-            <main class="flex-1 p-6 lg:p-12 overflow-y-auto">
-                <div class="max-w-4xl mx-auto">
-                    <div class="flex justify-between items-center mb-8">
-                        <div>
-                            <h2 class="text-2xl font-bold">Cloud Registry</h2>
-                            <p class="text-xs text-slate-500 mt-1">Live synchronized data</p>
-                        </div>
-                        <span id="record-count" class="text-[10px] font-bold text-blue-400 bg-blue-500/10 px-4 py-1.5 rounded-full border border-blue-500/20">0 RECORDS</span>
-                    </div>
-
-                    <div class="glass rounded-3xl overflow-hidden shadow-2xl">
-                        <table class="w-full text-left">
-                            <thead class="bg-white/5 text-[10px] text-slate-500 uppercase font-bold tracking-widest border-b border-white/5">
-                                <tr><th class="px-8 py-5">Endpoint</th><th class="px-8 py-5">BIN Identifier</th><th class="px-8 py-5 text-right">Action</th></tr>
-                            </thead>
-                            <tbody id="db-body" class="text-xs divide-y divide-white/5"></tbody>
-                        </table>
-                        <div id="empty-state" class="py-24 text-center hidden">
-                            <p class="text-slate-500 text-sm">No data matching your search.</p>
-                        </div>
-                    </div>
+            <div class="lg:col-span-2 glass rounded-2xl overflow-hidden">
+                <div class="p-4 border-b border-white/5 flex justify-between items-center">
+                    <input type="text" id="search-db" placeholder="Filter sites..." class="input-saas px-4 py-2 rounded-lg w-64 text-sm" onkeyup="filterTable()">
+                    <button onclick="clearAllData()" class="text-red-400 hover:text-red-300 text-sm font-semibold">Clear All</button>
                 </div>
-            </main>
+                <div class="overflow-x-auto max-h-[600px]">
+                    <table class="w-full text-left">
+                        <thead class="bg-white/5 text-gray-400 text-sm">
+                            <tr>
+                                <th class="p-4 font-semibold">Site</th>
+                                <th class="p-4 font-semibold">Bin</th>
+                                <th class="p-4 text-right">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="db-body"></tbody>
+                    </table>
+                </div>
+            </div>
         </div>
     </div>
 
     <script>
         lucide.createIcons();
 
-        function toast(msg, type='success') {
+        function toast(msg) {
             const container = document.getElementById('toast-container');
-            const div = document.createElement('div');
-            div.className = 'toast-glass p-4 rounded-2xl flex items-center gap-4 min-w-[280px] animate-toast pointer-events-auto shadow-2xl';
-            div.innerHTML = `<i data-lucide="${type==='success'?'check-circle':'alert-circle'}" class="w-5 h-5 ${type==='success'?'text-green-400':'text-red-400'}"></i><span class="text-xs font-semibold text-slate-200">${msg}</span>`;
-            container.appendChild(div);
+            const t = document.createElement('div');
+            t.className = 'toast-glass px-6 py-3 rounded-xl text-sm font-medium animate-toast flex items-center gap-3';
+            t.innerHTML = `<i data-lucide="info" class="w-4 h-4 text-blue-400"></i> ${msg}`;
+            container.appendChild(t);
             lucide.createIcons();
-            setTimeout(() => div.remove(), 3000);
+            setTimeout(() => t.remove(), 3000);
         }
 
-        async function attemptLogin() {
+        async function handleLogin() {
+            const key = document.getElementById('admin-key').value;
             const res = await fetch('/api/admin/login', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({key: document.getElementById('auth-key').value})
+                body: JSON.stringify({key})
             });
             if(res.ok) {
                 document.getElementById('login-screen').style.display = 'none';
-                document.getElementById('app-interface').style.display = 'flex';
-                toast('Secure Session Started');
+                document.getElementById('app-interface').style.display = 'block';
                 loadData();
-            } else toast('Authentication Denied', 'error');
+            } else {
+                toast('Invalid access key');
+            }
         }
 
         async function loadData() {
             const res = await fetch('/api/admin/list');
             const data = await res.json();
-            const tbody = document.getElementById('db-body');
-            tbody.innerHTML = "";
-            data.forEach(item => renderRow(item.site, item.bin));
-            updateCount();
-        }
-
-        async function addSite() {
-            const site = document.getElementById('as').value;
-            const binRaw = document.getElementById('ab').value;
-            if(!site || !binRaw) return toast('Empty values detected', 'error');
-            
-            // Allow manual comma-separated BIN entry
-            const binArr = binRaw.split(',').map(b => b.trim());
-            
-            const res = await fetch('/api/admin/add', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({site, bin: binArr})
-            });
-            if(res.ok) {
-                binArr.forEach(b => renderRow(site, b));
-                document.getElementById('as').value = '';
-                document.getElementById('ab').value = '';
-                toast('Cloud Synced');
-                updateCount();
-            }
-        }
-
-        function renderRow(site, bin) {
-            const tbody = document.getElementById('db-body');
-            const row = document.createElement('tr');
-            row.className = "hover:bg-white/[0.02] transition-colors";
-            row.innerHTML = `<td class="px-8 py-5 text-white font-medium">${site}</td>
-                             <td class="px-8 py-5 text-slate-400 font-mono tracking-widest">${bin}</td>
-                             <td class="px-8 py-5 text-right">
-                                <button onclick="removeRow(this, '${site}', '${bin}')" class="text-slate-600 hover:text-red-500 transition-colors">
-                                    <i data-lucide="trash-2" class="w-4 h-4"></i>
-                                </button>
-                             </td>`;
-            tbody.prepend(row);
+            const body = document.getElementById('db-body');
+            body.innerHTML = data.map(item => `
+                <tr class="border-b border-white/5 hover:bg-white/5 transition">
+                    <td class="p-4 font-medium">${item.site}</td>
+                    <td class="p-4 font-mono text-sm text-blue-400">${item.bin}</td>
+                    <td class="p-4 text-right">
+                        <button onclick="removeEntry('${item.site}', '${item.bin}')" class="text-gray-500 hover:text-red-400 transition">
+                            <i data-lucide="trash-2" class="w-4 h-4"></i>
+                        </button>
+                    </td>
+                </tr>
+            `).join('');
             lucide.createIcons();
         }
 
-        async function removeRow(btn, site, bin) {
-            const res = await fetch('/api/admin/remove', {
+        async function addEntry() {
+            const site = document.getElementById('site-in').value;
+            const binStr = document.getElementById('bin-in').value;
+            const bins = binStr.split(',').map(b => b.trim()).filter(b => b);
+            
+            await fetch('/api/admin/add', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({site, bin: bins})
+            });
+            document.getElementById('bin-in').value = '';
+            loadData();
+            toast('Entry updated');
+        }
+
+        async function removeEntry(site, bin) {
+            await fetch('/api/admin/remove', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({site, bin})
             });
-            if(res.ok) { 
-                btn.closest('tr').remove(); 
-                updateCount(); 
-                toast('Record Removed', 'error'); 
-            }
+            loadData();
         }
 
-        async function nuclearClear() {
-            if(!confirm("⚠️ PERMANENT WIPE: Clear all cloud data?")) return;
-            const res = await fetch('/api/admin/clear_all', { method: 'POST' });
-            if(res.ok) { 
-                document.getElementById('db-body').innerHTML = ""; 
-                updateCount(); 
-                toast('Cloud Purged', 'error'); 
-            }
-        }
-
-        function filterTable() {
-            const q = document.getElementById('search-input').value.toLowerCase();
-            const rows = document.querySelectorAll('#db-body tr');
-            let m = 0;
-            rows.forEach(r => {
-                const visible = r.innerText.toLowerCase().includes(q);
-                r.classList.toggle('row-hidden', !visible);
-                if(visible) m++;
-            });
-            document.getElementById('record-count').innerText = m + " MATCHES";
-            document.getElementById('empty-state').classList.toggle('hidden', m > 0);
-        }
-
-        function updateCount() {
-            const count = document.querySelectorAll('#db-body tr').length;
-            document.getElementById('record-count').innerText = count + " TOTAL RECORDS";
-            document.getElementById('empty-state').classList.toggle('hidden', count > 0);
+        async function clearAllData() {
+            if(!confirm('Delete everything?')) return;
+            await fetch('/api/admin/clear_all', { method: 'POST' });
+            loadData();
+            toast('Database cleared');
         }
 
         function exportData() {
@@ -343,21 +303,43 @@ HTML_TEMPLATE = r'''
 
         async function importData(e) {
             const file = e.target.files[0];
+            if (!file) return;
+
             const reader = new FileReader();
             reader.onload = async (event) => {
                 const data = JSON.parse(event.target.result);
-                toast(`Importing ${data.length} segments...`);
+                
+                // Show Processing Screen
+                const loader = document.getElementById('import-loader');
+                const status = document.getElementById('import-status');
+                loader.style.display = 'flex';
+
+                let count = 0;
                 for(const item of data) {
+                    count++;
+                    status.innerText = `Processing segment ${count} of ${data.length}...`;
+                    
                     await fetch('/api/admin/add', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({site: item.site, bin: item.bin})
                     });
                 }
+                
+                // Hide Processing Screen
+                loader.style.display = 'none';
                 loadData();
                 toast('Cloud Resynced');
             };
             reader.readAsText(file);
+        }
+
+        function filterTable() {
+            const q = document.getElementById('search-db').value.toLowerCase();
+            const rows = document.querySelectorAll('#db-body tr');
+            rows.forEach(r => {
+                r.style.display = r.innerText.toLowerCase().includes(q) ? '' : 'none';
+            });
         }
     </script>
 </body>
